@@ -158,11 +158,13 @@ export function reconstructState(entries: JsonlEntry[]): SessionState {
 
   // Recalculate derived state
   if (state.results.length > 0) {
-    // Baseline = first result in current segment
+    // Baseline = first result in current segment (matching pi-autoresearch)
     const currentSegmentResults = state.results.filter(
       (r) => r.segment === state.currentSegment,
     );
-    state.baselineMetric = currentSegmentResults[0]?.metric ?? null;
+    state.baselineMetric = currentSegmentResults.length > 0
+      ? currentSegmentResults[0].metric
+      : null;
 
     // Best kept metric
     let best: number | null = null;
