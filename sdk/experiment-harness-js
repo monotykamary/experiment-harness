@@ -34,7 +34,7 @@ SERVER="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/server.ts"
 LOG="${EXPERIMENT_HARNESS_LOG:-/tmp/experiment-harness.log}"
 
 # ---------------------------------------------------------------------------
-# Bootstrap bun if missing
+# Bootstrap bun if missing — the experiment server is Bun-native.
 # ---------------------------------------------------------------------------
 
 ensure_bun() {
