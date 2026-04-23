@@ -6,7 +6,7 @@
  * commit/revert operations that preserve autoresearch files.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -23,8 +23,9 @@ const PROTECTED_FILES = [
 /** Get the path to the global gitignore file. */
 function getGlobalGitignorePath(): string | null {
   try {
-    const result = execSync("git config --global core.excludesfile", {
+    const result = execFileSync("git", ["config", "--global", "core.excludesfile"], {
       encoding: "utf-8",
+      timeout: 5000,
       stdio: ["pipe", "pipe", "ignore"],
     });
     const configured = result.trim();
@@ -80,10 +81,11 @@ function ensureGlobalGitignore(): void {
 
 /**
  * Run a git command in a working directory. Returns stdout.
+ * Uses execFileSync to avoid shell injection.
  * Throws on non-zero exit code.
  */
 export function git(cwd: string, args: string[], timeout: number = 10000): string {
-  const result = execSync(`git ${args.join(" ")}`, {
+  const result = execFileSync("git", args, {
     cwd,
     encoding: "utf-8",
     timeout,
@@ -94,6 +96,7 @@ export function git(cwd: string, args: string[], timeout: number = 10000): strin
 
 /**
  * Run a git command, returning { ok, stdout, code } instead of throwing.
+ * Uses execFileSync to avoid shell injection.
  */
 export function gitSafe(
   cwd: string,
@@ -101,7 +104,7 @@ export function gitSafe(
   timeout: number = 10000,
 ): { ok: boolean; stdout: string; code: number } {
   try {
-    const result = execSync(`git ${args.join(" ")}`, {
+    const result = execFileSync("git", args, {
       cwd,
       encoding: "utf-8",
       timeout,
@@ -109,9 +112,10 @@ export function gitSafe(
     });
     return { ok: true, stdout: result.trim(), code: 0 };
   } catch (e: any) {
+    const stdout = (e?.stdout?.toString() ?? "") + (e?.stderr?.toString() ?? "");
     return {
       ok: false,
-      stdout: (e?.stdout ?? "") + (e?.stderr ?? ""),
+      stdout,
       code: e?.status ?? 1,
     };
   }
@@ -219,20 +223,46 @@ export function commitChanges(
 
 /**
  * Revert changes in the worktree, preserving protected autoresearch files.
- * Used after a discard/crash to restore the working tree to the last commit.
+ * Uses execFileSync with proper argument arrays to avoid shell injection.
  */
 export function revertChanges(workDir: string): boolean {
   try {
     // Stage protected files so they survive the checkout
-    const stageCmd = PROTECTED_FILES
-      .map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`)
-      .join("; ");
-    execSync(`${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`, {
+    for (const f of PROTECTED_FILES) {
+      const filePath = path.join(workDir, f);
+      // Best-effort: add if it exists, ignore errors
+      try {
+        execFileSync("git", ["add", filePath], {
+          cwd: workDir,
+          encoding: "utf-8",
+          timeout: 5000,
+          stdio: ["pipe", "pipe", "ignore"],
+        });
+      } catch {
+        // File may not exist — that's fine
+      }
+    }
+
+    // Revert tracked changes
+    execFileSync("git", ["checkout", "--", "."], {
       cwd: workDir,
       encoding: "utf-8",
       timeout: 10000,
       stdio: ["pipe", "pipe", "ignore"],
     });
+
+    // Remove untracked files (best-effort)
+    try {
+      execFileSync("git", ["clean", "-fd"], {
+        cwd: workDir,
+        encoding: "utf-8",
+        timeout: 10000,
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    } catch {
+      // clean may fail if no untracked files — that's fine
+    }
+
     return true;
   } catch {
     return false;
