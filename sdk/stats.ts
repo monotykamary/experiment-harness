@@ -8,6 +8,41 @@ import type { ExperimentResult, MetricDef } from "./types.ts";
 // Basics
 // ---------------------------------------------------------------------------
 
+/** Check if a metric change is an improvement (in the desired direction). */
+export function isImprovement(
+  current: number,
+  baseline: number,
+  direction: "lower" | "higher",
+): boolean {
+  return direction === "lower" ? current < baseline : current > baseline;
+}
+
+/**
+ * Format an improvement percentage that's intuitive for both directions.
+ * For "lower": a decrease shows as positive improvement (e.g. -18% → "+18.0% faster").
+ * For "higher": an increase shows as positive improvement.
+ * Returns null if baseline is 0, or if there's no change, or if the change
+ * is a regression.
+ */
+export function formatImprovement(
+  current: number,
+  baseline: number,
+  direction: "lower" | "higher",
+): string | null {
+  if (baseline === 0) return null;
+  if (current === baseline) return null;
+
+  const improved = isImprovement(current, baseline, direction);
+  const delta = current - baseline;
+  const pct = Math.abs((delta / baseline) * 100).toFixed(1);
+
+  if (improved) {
+    return `+${pct}%`;
+  } else {
+    return `-${pct}%`;
+  }
+}
+
 /** Compute the median of a numeric array (returns 0 for empty arrays). */
 export function sortedMedian(values: number[]): number {
   if (values.length === 0) return 0;
