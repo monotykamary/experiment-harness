@@ -1834,27 +1834,6 @@ describe("Session integration", () => {
     }
   });
 
-  // --- Guard ---
-
-  it("setGuard stores config", async () => {
-    await session.init({
-      cwd: tmpDir,
-      worktree: false,
-      config: {
-        name: "Guard Test",
-        metricName: "seconds",
-        direction: "lower",
-        command: "echo METRIC seconds=10",
-      },
-    });
-
-    const result = session.setGuard({
-      command: "pnpm test",
-      mode: "pass-fail",
-    });
-    expect(result.ok).toBe(true);
-  });
-
   // --- Strategy ---
 
   it("setStrategy updates the strategy", async () => {
@@ -1935,7 +1914,7 @@ function makeState(baseline: number | null, direction: "lower" | "higher"): Sess
     confidence: null,
     targetValue: null,
     maxRuns: null,
-    guard: null,
+
   };
 }
 
@@ -2289,6 +2268,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: null,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     const result = loop.start(host);
     expect(result.ok).toBe(false);
@@ -2304,6 +2284,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: null,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     const result = loop.start(host, { pollIntervalSeconds: 60 });
     expect(result.ok).toBe(true);
@@ -2320,6 +2301,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: null,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     loop.start(host, { pollIntervalSeconds: 60 });
     const result = loop.start(host);
@@ -2337,6 +2319,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: null,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     loop.start(host, { pollIntervalSeconds: 60 });
     loop.stop();
@@ -2353,6 +2336,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: 1,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     loop.start(host, { pollIntervalSeconds: 0.01, plateauPatience: 15 });
     // Wait for loop to detect maxRuns
@@ -2369,6 +2353,7 @@ describe("session/loop: LoopController", () => {
       direction: "lower",
       maxRuns: null,
       setLoopStatus: () => {},
+      cwd: os.tmpdir(),
     };
     loop.start(host, { pollIntervalSeconds: 0.01, stopOnTarget: true });
     await Bun.sleep(200);

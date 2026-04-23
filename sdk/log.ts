@@ -14,10 +14,9 @@ import type {
   ExperimentResult,
   SessionState,
   SessionConfig,
-  MetricDef,
 } from "./types.ts";
 import { inferUnit } from "./parse.ts";
-import { computeConfidence, registerSecondaryMetrics } from "./stats.ts";
+import { computeConfidence, registerSecondaryMetrics, isBetter } from "./stats.ts";
 
 // ---------------------------------------------------------------------------
 // Writing
@@ -98,7 +97,7 @@ export function reconstructState(entries: JsonlEntry[]): SessionState {
     confidence: null,
     targetValue: null,
     maxRuns: null,
-    guard: null,
+
   };
 
   let lastConfig: SessionConfig | null = null;
@@ -169,8 +168,8 @@ export function reconstructState(entries: JsonlEntry[]): SessionState {
     // Best kept metric
     let best: number | null = null;
     for (const r of currentSegmentResults) {
-      if (r.status === "keep" && r.metric > 0) {
-        if (best === null || (state.direction === "lower" ? r.metric < best : r.metric > best)) {
+      if (r.status === "keep") {
+        if (best === null || isBetter(r.metric, best, state.direction)) {
           best = r.metric;
         }
       }

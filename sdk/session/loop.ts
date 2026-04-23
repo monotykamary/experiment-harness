@@ -44,7 +44,10 @@ export interface LoopHost {
   /** Current max runs. */
   readonly maxRuns: number | null;
 
-  /** Update loop status. */
+  /** Working directory for file-change detection. */
+  readonly cwd: string;
+
+  /** Update loop status (intentional no-op by default). */
   setLoopStatus(status: LoopStatus): void;
 }
 
@@ -142,10 +145,7 @@ export class LoopController {
       }
 
       // Detect file changes since last run (including untracked files)
-      const changes = detectFileChanges(
-        // We need the workDir; the host must expose it
-        (host as any).workDir ?? "",
-      );
+      const changes = detectFileChanges(host.cwd);
       if (changes.length === 0) {
         await Bun.sleep(pollInterval);
         continue;

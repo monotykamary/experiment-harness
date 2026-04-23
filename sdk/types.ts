@@ -24,7 +24,6 @@ export interface SessionConfig {
   command: string;
   targetValue?: number;
   maxRuns?: number;
-  checksCommand?: string;
   checksTimeoutSeconds?: number;
 }
 
@@ -33,7 +32,6 @@ export interface SessionConfig {
 // ---------------------------------------------------------------------------
 
 export type ExperimentStatus =
-  | "baseline"
   | "keep"
   | "discard"
   | "crash"
@@ -71,19 +69,6 @@ export interface ExperimentResult {
 // ---------------------------------------------------------------------------
 // Guard
 // ---------------------------------------------------------------------------
-
-export type GuardMode = "pass-fail" | "metric-valued";
-
-export interface GuardConfig {
-  command: string;
-  mode: GuardMode;
-  /** Only for metric-valued guards. */
-  direction?: "lower" | "higher";
-  /** Only for metric-valued guards. Max allowed regression as % of baseline. */
-  thresholdPercent?: number;
-  /** Timeout in seconds. */
-  timeoutSeconds?: number;
-}
 
 // ---------------------------------------------------------------------------
 // Strategy
@@ -167,7 +152,6 @@ export interface SessionState {
   confidence: number | null;
   targetValue: number | null;
   maxRuns: number | null;
-  guard: GuardConfig | null;
 }
 
 // ---------------------------------------------------------------------------

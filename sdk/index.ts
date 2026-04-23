@@ -9,8 +9,6 @@ export type {
   SessionConfig,
   ExperimentStatus,
   ExperimentResult,
-  GuardMode,
-  GuardConfig,
   StrategyName,
   StrategyConfig,
   StrategyDecision,
@@ -40,7 +38,6 @@ export {
   computeConfidence,
   detectPlateau,
   registerSecondaryMetrics,
-  findBaselineSecondary,
 } from "./stats.ts";
 
 // Strategy

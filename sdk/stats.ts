@@ -78,23 +78,22 @@ export function computeConfidence(
   results: ExperimentResult[],
   direction: "lower" | "higher",
 ): number | null {
-  const validResults = results.filter((r) => r.metric > 0);
-  if (validResults.length < 3) return null;
+  if (results.length < 3) return null;
 
-  const values = validResults.map((r) => r.metric);
+  const values = results.map((r) => r.metric);
   const median = sortedMedian(values);
   const deviations = values.map((v) => Math.abs(v - median));
   const mad = sortedMedian(deviations);
 
   if (mad === 0) return null;
 
-  const baseline = validResults[0]?.metric ?? null;
+  const baseline = results[0]?.metric ?? null;
   if (baseline === null) return null;
 
   // Find best kept metric
   let bestKept: number | null = null;
-  for (const r of validResults) {
-    if (r.status === "keep" && r.metric > 0) {
+  for (const r of results) {
+    if (r.status === "keep") {
       if (bestKept === null || isBetter(r.metric, bestKept, direction)) {
         bestKept = r.metric;
       }
@@ -127,7 +126,7 @@ export function detectPlateau(
 
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
-    if (r.metric > 0 && r.status === "keep") {
+    if (r.status === "keep") {
       if (bestMetric === null || isBetter(r.metric, bestMetric, direction)) {
         bestMetric = r.metric;
         bestIdx = i;
@@ -163,28 +162,4 @@ export function registerSecondaryMetrics(
   return updated;
 }
 
-/** Find secondary metric baselines from the first experiment in current segment. */
-export function findBaselineSecondary(
-  results: ExperimentResult[],
-  segment: number,
-  knownMetrics?: MetricDef[],
-): Record<string, number> {
-  const cur = results.filter((r) => r.segment === segment);
-  const base: Record<string, number> = cur.length > 0 ? { ...(cur[0].metrics ?? {}) } : {};
 
-  if (knownMetrics) {
-    for (const sm of knownMetrics) {
-      if (base[sm.name] === undefined) {
-        for (const r of cur) {
-          const val = (r.metrics ?? {})[sm.name];
-          if (val !== undefined) {
-            base[sm.name] = val;
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  return base;
-}

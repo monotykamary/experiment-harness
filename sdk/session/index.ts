@@ -19,7 +19,6 @@ import type {
   ExperimentResult,
   ExperimentStatus,
   RunDetails,
-  GuardConfig,
   StrategyConfig,
   LoopOptions,
   LoopStatus,
@@ -53,7 +52,7 @@ import {
 import { createStrategy, type Strategy } from "../strategy.ts";
 import { executeRun, makeErrorRunDetails } from "./run.ts";
 import { LoopController, type LoopHost } from "./loop.ts";
-import { createTempFileAllocator } from "./process.ts";
+
 
 // ---------------------------------------------------------------------------
 // Session
@@ -63,7 +62,7 @@ export class Session implements LoopHost {
   // Project root (where the git repo lives)
   private repoCwd: string = "";
   // Working directory (worktree if active, otherwise repoCwd)
-  /** @internal */ workDir: string = "";
+  workDir: string = "";
   // Worktree path (null if not using worktree isolation)
   private worktreeDir: string | null = null;
 
@@ -84,6 +83,9 @@ export class Session implements LoopHost {
 
   // Loop controller (extracted from session)
   private loop: LoopController;
+
+  // Whether loop was started with a custom strategy (so stopLoop can restore default)
+  private loopHadCustomStrategy = false;
 
   // Session ID (used for worktree naming)
   private sessionId: string = "";
@@ -108,7 +110,7 @@ export class Session implements LoopHost {
       confidence: null,
       targetValue: null,
       maxRuns: null,
-      guard: null,
+
     };
   }
 
@@ -126,10 +128,15 @@ export class Session implements LoopHost {
     return this.state.maxRuns;
   }
 
+  /** Directory for file-change detection — exposed for LoopHost. */
+  get cwd(): string {
+    return this.workDir;
+  }
+
   /** Update loop status — called by LoopController. */
-  setLoopStatus(status: LoopStatus): void {
-    // The loop controller manages its own status;
-    // this is a no-op hook for future extensibility.
+  setLoopStatus(_status: LoopStatus): void {
+    // Intentional no-op: LoopController manages its own status internally.
+    // This hook exists for future extensibility (e.g. dashboard updates).
   }
 
   // -----------------------------------------------------------------------
@@ -371,7 +378,7 @@ export class Session implements LoopHost {
     // Update best metric (across all kept results in current segment)
     let best: number | null = null;
     for (const r of currentSegmentResults) {
-      if (r.status === "keep" && r.metric > 0) {
+      if (r.status === "keep") {
         if (best === null || isBetter(r.metric, best, this.state.direction)) {
           best = r.metric;
         }
@@ -414,7 +421,6 @@ export class Session implements LoopHost {
     const targetReached =
       opts.status === "keep" &&
       this.state.targetValue !== null &&
-      opts.metric > 0 &&
       (this.state.direction === "lower"
         ? opts.metric <= this.state.targetValue
         : opts.metric >= this.state.targetValue);
@@ -476,7 +482,7 @@ export class Session implements LoopHost {
     } else {
       // Passed — use strategy to decide
       const metric = runResult.parsedPrimary ?? 0;
-      if (metric > 0 && this.state.baselineMetric !== null) {
+      if (runResult.parsedPrimary !== null && this.state.baselineMetric !== null) {
         // Create a tentative result for strategy evaluation
         const tentativeResult: ExperimentResult = {
           run: this.state.results.length + 1,
@@ -544,12 +550,14 @@ export class Session implements LoopHost {
     // (so runAndLog uses it; restored on stop)
     if (opts.strategy) {
       this.strategy = createStrategy(opts.strategy);
+      this.loopHadCustomStrategy = true;
     }
 
     const result = this.loop.start(this, opts);
-    if (!result.ok && opts.strategy) {
+    if (!result.ok && this.loopHadCustomStrategy) {
       // Restore default strategy on failure
       this.strategy = createStrategy();
+      this.loopHadCustomStrategy = false;
     }
     return result;
   }
@@ -559,8 +567,9 @@ export class Session implements LoopHost {
     const result = this.loop.stop();
 
     // Restore default strategy if loop had overridden it
-    if (this.loop["options"]?.strategy) {
+    if (this.loopHadCustomStrategy) {
       this.strategy = createStrategy();
+      this.loopHadCustomStrategy = false;
     }
 
     return result;
@@ -592,7 +601,7 @@ export class Session implements LoopHost {
     worktree: string | null;
   } {
     const kept = this.state.results.filter((r) => r.status === "keep").length;
-    const discarded = this.state.results.filter((r) => r.status !== "keep" && r.status !== "baseline").length;
+    const discarded = this.state.results.filter((r) => r.status !== "keep").length;
 
     const improvement = formatImprovement(
       this.state.bestMetric ?? 0,
@@ -654,12 +663,6 @@ export class Session implements LoopHost {
     this.workDir = this.repoCwd;
     this.jsonlPath = "";
 
-    return { ok: true };
-  }
-
-  /** Set the guard configuration. */
-  setGuard(config: GuardConfig): { ok: boolean } {
-    this.state.guard = config;
     return { ok: true };
   }
 
