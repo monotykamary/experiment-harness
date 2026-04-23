@@ -8,7 +8,9 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { spawn } from "node:child_process";
+import * as os from "node:os";
+import { spawn, execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import type {
   SessionConfig,
   SessionState,
@@ -23,10 +25,22 @@ import type {
   JsonlConfigEntry,
   JsonlResultEntry,
 } from "./types.ts";
-import { parseMetricLines, isAutoresearchShCommand } from "./parse.ts";
+import { parseMetricLines, isAutoresearchShCommand, inferUnit } from "./parse.ts";
 import { formatNum } from "./format.ts";
-import { isBetter, computeConfidence, detectPlateau, registerSecondaryMetrics } from "./stats.ts";
-import { reconstructState, writeConfig as writeJsonlConfig, writeResult as writeJsonlResult, readEntries, deleteLog } from "./log.ts";
+import {
+  isBetter,
+  computeConfidence,
+  detectPlateau,
+  registerSecondaryMetrics,
+  formatImprovement,
+} from "./stats.ts";
+import {
+  reconstructState,
+  writeConfig as writeJsonlConfig,
+  writeResult as writeJsonlResult,
+  readEntries,
+  deleteLog,
+} from "./log.ts";
 import {
   createWorktree,
   removeWorktree,
@@ -56,13 +70,13 @@ function killTree(pid: number): void {
   }
 }
 
-/** Lazy temp file allocator. */
+/** Lazy temp file allocator. Uses OS tmpdir and crypto-random IDs (matching pi-autoresearch). */
 function createTempFileAllocator(): () => string {
   let p: string | undefined;
   return () => {
     if (!p) {
-      const id = Math.random().toString(36).slice(2, 18);
-      p = path.join(import.meta.dir || "/tmp", `experiment-${id}.log`);
+      const id = randomBytes(8).toString("hex");
+      p = path.join(os.tmpdir(), `experiment-${id}.log`);
     }
     return p;
   };
@@ -88,6 +102,12 @@ export class Session {
 
   // Strategy for keep/discard decisions
   private strategy: Strategy;
+
+  // Last run details (used to gate log() on failed checks)
+  private lastRunDetails: RunDetails | null = null;
+
+  // Temp files created during runs (cleaned up on clear())
+  private tempFiles: Set<string> = new Set();
 
   // Loop state
   private loopStatus: LoopStatus = "idle";
@@ -266,10 +286,6 @@ export class Session {
     const timeout = (opts.timeoutSeconds ?? 600) * 1000;
     const t0 = Date.now();
 
-    // Capture starting commit BEFORE running
-    const startingCommit = getHeadCommit(this.workDir);
-
-    // Spawn the process
     const getTempFile = createTempFileAllocator();
     const {
       exitCode,
@@ -329,7 +345,10 @@ export class Session {
       fs.writeFileSync(fullOutputPath, output);
     }
 
-    return {
+    // Track temp files for cleanup
+    if (fullOutputPath) this.tempFiles.add(fullOutputPath);
+
+    const runDetails: RunDetails = {
       command: config.command,
       exitCode,
       durationSeconds,
@@ -347,6 +366,11 @@ export class Session {
       metricUnit: this.state.metricUnit,
       fullOutputPath,
     };
+
+    // Store last run details for the log() checks gate
+    this.lastRunDetails = runDetails;
+
+    return runDetails;
   }
 
   // -----------------------------------------------------------------------
@@ -370,7 +394,7 @@ export class Session {
     autoReverted?: boolean;
     commit?: string;
     confidence?: number | null;
-    improvement?: string;
+    improvement?: string | null;
     targetReached?: boolean;
   }> {
     if (!this.jsonlPath) {
@@ -381,29 +405,24 @@ export class Session {
       return { ok: false, error: "Session not initialized — call init() first" };
     }
 
-    // Cannot keep when checks failed
+    // Cannot keep when checks failed (mirrors pi-autoresearch's runtime.lastRunChecks gate)
     if (opts.status === "keep" && this.lastRunChecksFailed()) {
       return {
         ok: false,
-        error: "Cannot keep — checks failed. Log as 'checks_failed' instead.",
+        error:
+          "Cannot keep — checks failed. Log as 'checks_failed' instead.\n\n" +
+          (this.lastRunDetails?.checksOutput?.slice(-500) ?? ""),
       };
     }
 
     const commit = getHeadCommit(this.workDir);
     const secondaryMetrics = opts.metrics ?? {};
 
-    // Register secondary metrics
+    // Register secondary metrics (use shared inferUnit from parse.ts)
     this.state.secondaryMetrics = registerSecondaryMetrics(
       this.state.secondaryMetrics,
       secondaryMetrics,
-      (name: string) => {
-        if (name.endsWith("µs")) return "µs";
-        if (name.endsWith("_ms")) return "ms";
-        if (name.endsWith("_s") || name.endsWith("_sec")) return "s";
-        if (name.endsWith("_kb")) return "kb";
-        if (name.endsWith("_mb")) return "mb";
-        return "";
-      },
+      inferUnit,
     );
 
     // Build experiment result
@@ -424,15 +443,19 @@ export class Session {
     this.state.results.push(experiment);
 
     // Recalculate derived state
-    this.state.baselineMetric = this.state.results[0]?.metric ?? null;
+    // Baseline = first result in the current segment (matching pi-autoresearch)
+    const currentSegmentResults = this.state.results.filter(
+      (r) => r.segment === this.state.currentSegment,
+    );
+    this.state.baselineMetric = currentSegmentResults[0]?.metric ?? null;
     this.state.confidence = computeConfidence(this.state.results, this.state.direction);
 
     // Set confidence on the result before persisting
     experiment.confidence = this.state.confidence;
 
-    // Update best metric
+    // Update best metric (across all kept results in current segment)
     let best: number | null = null;
-    for (const r of this.state.results) {
+    for (const r of currentSegmentResults) {
       if (r.status === "keep" && r.metric > 0) {
         if (best === null || isBetter(r.metric, best, this.state.direction)) {
           best = r.metric;
@@ -466,7 +489,7 @@ export class Session {
       }
     }
 
-    // Auto-revert on discard/crash/checks_failed
+    // Auto-revert on discard/crash/checks_failed/timeout/metric_error/no_op/hook_blocked
     let autoReverted = false;
     if (opts.status !== "keep") {
       autoReverted = revertChanges(this.workDir);
@@ -481,14 +504,12 @@ export class Session {
         ? opts.metric <= this.state.targetValue
         : opts.metric >= this.state.targetValue);
 
-    // Build improvement string
-    let improvement: string | undefined;
-    if (this.state.baselineMetric !== null && opts.metric > 0 && opts.metric !== this.state.baselineMetric) {
-      const delta = opts.metric - this.state.baselineMetric;
-      const pct = ((delta / this.state.baselineMetric) * 100).toFixed(1);
-      const sign = delta > 0 ? "+" : "";
-      improvement = `${sign}${pct}%`;
-    }
+    // Build improvement string (direction-aware: positive = improvement)
+    const improvement = formatImprovement(
+      opts.metric,
+      this.state.baselineMetric ?? 0,
+      this.state.direction,
+    );
 
     return {
       ok: true,
@@ -522,8 +543,8 @@ export class Session {
     // Run the experiment
     const runResult = await this.run({ timeoutSeconds: opts.timeoutSeconds });
 
-    if (!runResult.passed && runResult.exitCode === null) {
-      // Spawn failure
+    // Handle spawn failure (not timeout — that's a proper experiment result)
+    if (!runResult.passed && !runResult.timedOut && runResult.exitCode === null) {
       return { ok: false, error: runResult.tailOutput };
     }
 
@@ -556,10 +577,21 @@ export class Session {
         };
 
         const decision = this.strategy.evaluate(tentativeResult, this.state);
-        if (decision === "discard") {
-          status = "discard";
-        } else {
-          status = "keep";
+        switch (decision) {
+          case "keep":
+            status = "keep";
+            break;
+          case "discard":
+            status = "discard";
+            break;
+          case "rework":
+            // Improvement is marginal (below confidence threshold).
+            // Log as no_op so the result is tracked but code is reverted,
+            // signaling that a re-run would be beneficial.
+            status = "no_op";
+            break;
+          default:
+            status = "discard";
         }
       } else {
         // First run or no parsed metric — always keep as baseline
@@ -605,6 +637,12 @@ export class Session {
     this.loopAbort = new AbortController();
     this.loopStatus = "running";
 
+    // Apply the loop's strategy to the session if specified
+    // (so runAndLog uses it; restored on stop)
+    if (opts.strategy) {
+      this.strategy = createStrategy(opts.strategy);
+    }
+
     const loopId = `loop-${Date.now()}`;
 
     // Run the loop in the background (non-blocking)
@@ -622,6 +660,12 @@ export class Session {
       this.loopAbort.abort();
     }
     this.loopStatus = "stopped";
+
+    // Restore default strategy if loop had overridden it
+    if (this.loopOptions?.strategy) {
+      this.strategy = createStrategy();
+    }
+
     return { ok: true };
   }
 
@@ -633,7 +677,6 @@ export class Session {
   private async runLoop(opts: LoopOptions, signal: AbortSignal): Promise<void> {
     const pollInterval = (opts.pollIntervalSeconds ?? 2) * 1000;
     const plateauPatience = opts.plateauPatience ?? 15;
-    const strategy = createStrategy(opts.strategy);
     let lastRunTime = 0;
 
     while (!signal.aborted) {
@@ -660,7 +703,7 @@ export class Session {
         return;
       }
 
-      // Detect file changes since last run
+      // Detect file changes since last run (including untracked files)
       const changes = this.detectFileChanges();
       if (changes.length === 0) {
         await Bun.sleep(pollInterval);
@@ -690,18 +733,31 @@ export class Session {
       : this.state.bestMetric >= this.state.targetValue;
   }
 
-  /** Detect file changes in the worktree since last run. */
+  /** Detect file changes in the worktree since last run (tracked and untracked). */
   private detectFileChanges(): string[] {
     try {
-      const { execSync } = require("node:child_process");
-      const result = execSync("git diff --name-only HEAD", {
+      // Tracked changes
+      const tracked = execFileSync("git", ["diff", "--name-only", "HEAD"], {
         cwd: this.workDir,
         encoding: "utf-8",
         timeout: 5000,
         stdio: ["pipe", "pipe", "ignore"],
       }).trim();
-      if (!result) return [];
-      return result.split("\n").filter(Boolean);
+
+      // Untracked files (not yet added to git)
+      const untracked = execFileSync(
+        "git",
+        ["ls-files", "--others", "--exclude-standard"],
+        {
+          cwd: this.workDir,
+          encoding: "utf-8",
+          timeout: 5000,
+          stdio: ["pipe", "pipe", "ignore"],
+        },
+      ).trim();
+
+      const all = (tracked + "\n" + untracked).split("\n").filter(Boolean);
+      return [...new Set(all)]; // deduplicate
     } catch {
       return [];
     }
@@ -717,6 +773,7 @@ export class Session {
     name: string | null;
     runs: number;
     kept: number;
+    discarded: number;
     bestMetric: number | null;
     baselineMetric: number | null;
     improvement: string | null;
@@ -727,25 +784,20 @@ export class Session {
     worktree: string | null;
   } {
     const kept = this.state.results.filter((r) => r.status === "keep").length;
+    const discarded = this.state.results.filter((r) => r.status !== "keep" && r.status !== "baseline").length;
 
-    let improvement: string | null = null;
-    if (
-      this.state.bestMetric !== null &&
-      this.state.baselineMetric !== null &&
-      this.state.baselineMetric !== 0 &&
-      this.state.bestMetric !== this.state.baselineMetric
-    ) {
-      const delta = this.state.bestMetric - this.state.baselineMetric;
-      const pct = ((delta / this.state.baselineMetric) * 100).toFixed(1);
-      const sign = delta > 0 ? "+" : "";
-      improvement = `${sign}${pct}%`;
-    }
+    const improvement = formatImprovement(
+      this.state.bestMetric ?? 0,
+      this.state.baselineMetric ?? 0,
+      this.state.direction,
+    );
 
     return {
       initialized: this.state.config !== null,
       name: this.state.config?.name ?? null,
       runs: this.state.results.length,
       kept,
+      discarded,
       bestMetric: this.state.bestMetric,
       baselineMetric: this.state.baselineMetric,
       improvement,
@@ -766,7 +818,7 @@ export class Session {
     return [...results];
   }
 
-  /** Clear session state. */
+  /** Clear session state and clean up resources. */
   clear(): { ok: boolean } {
     if (this.loopAbort) {
       this.loopAbort.abort();
@@ -782,7 +834,18 @@ export class Session {
       deleteLog(this.jsonlPath);
     }
 
+    // Clean up temp files
+    for (const f of this.tempFiles) {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+    this.tempFiles.clear();
+
     this.state = this.createInitialState();
+    this.lastRunDetails = null;
     this.workDir = this.repoCwd;
     this.jsonlPath = "";
 
@@ -804,6 +867,15 @@ export class Session {
   // -----------------------------------------------------------------------
   // Internal Helpers
   // -----------------------------------------------------------------------
+
+  /**
+   * Check whether the last run's checks failed.
+   * Mirrors pi-autoresearch's runtime.lastRunChecks gate.
+   */
+  private lastRunChecksFailed(): boolean {
+    if (!this.lastRunDetails) return false;
+    return this.lastRunDetails.checksPass === false;
+  }
 
   private async spawnProcess(
     command: string,
@@ -910,12 +982,4 @@ export class Session {
       metricUnit: this.state.metricUnit,
     };
   }
-
-  private lastRunChecksFailed(): boolean {
-    // This is a simple guard — in a fuller implementation we'd track
-    // the last run's checks result in the session state.
-    return false;
-  }
 }
-
-
