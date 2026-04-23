@@ -2,14 +2,16 @@
  * Number, time, and size formatting utilities.
  */
 
-/** Format a number with comma-separated thousands: 15586 → "15,586" */
+/** Format a number with comma-separated thousands: 15586 → "15,586", -15586 → "-15,586" */
 export function commas(n: number): string {
-  const s = String(Math.round(n));
+  const abs = Math.abs(Math.round(n));
+  const s = String(abs);
   const parts: string[] = [];
   for (let i = s.length; i > 0; i -= 3) {
     parts.unshift(s.slice(Math.max(0, i - 3), i));
   }
-  return parts.join(",");
+  const formatted = parts.join(",");
+  return n < 0 ? `-${formatted}` : formatted;
 }
 
 /** Format number with commas, preserving decimals. */
