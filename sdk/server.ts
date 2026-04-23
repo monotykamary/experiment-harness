@@ -11,7 +11,7 @@
  * State: `session` and any `globalThis.<name>` you set persist across requests.
  */
 
-import { Session } from "./session.ts";
+import { Session } from "./session/index.ts";
 
 const session = new Session();
 (globalThis as any).session = session;

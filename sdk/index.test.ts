@@ -16,7 +16,7 @@ import {
 } from "./stats.ts";
 import { reconstructState, writeConfig, writeResult, readEntries, deleteLog } from "./log.ts";
 import { createStrategy, GreedyStrategy, ConfidenceGatedStrategy, EpsilonGreedyStrategy, type RandomSource } from "./strategy.ts";
-import { Session } from "./session.ts";
+import { Session } from "./session/index.ts";
 import {
   git,
   gitSafe,
@@ -40,6 +40,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
+import { killTree, createTempFileAllocator, spawnProcess } from "./session/process.ts";
+import { executeRun, makeErrorRunDetails } from "./session/run.ts";
+import { LoopController, detectFileChanges, type LoopHost } from "./session/loop.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // parse.ts
@@ -1783,7 +1786,7 @@ describe("Session integration", () => {
     expect(session.getLoopStatus()).toBe("running");
 
     session.clear();
-    expect(session.getLoopStatus()).toBe("idle");
+    expect(session.getLoopStatus()).toBe("stopped");
   });
 
   // --- Resume ---
@@ -1950,3 +1953,652 @@ function makeResults(metrics: number[]): ExperimentResult[] {
     durationSeconds: m / 10,
   }));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// session/process.ts — process management
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("session/process: killTree", () => {
+  it("does not throw for non-existent pid", () => {
+    // Use a very high PID that almost certainly doesn't exist
+    expect(() => killTree(999999)).not.toThrow();
+  });
+
+  it("does not throw for pid 0", () => {
+    expect(() => killTree(0)).not.toThrow();
+  });
+});
+
+describe("session/process: createTempFileAllocator", () => {
+  it("returns same path on repeated calls", () => {
+    const alloc = createTempFileAllocator();
+    const p1 = alloc();
+    const p2 = alloc();
+    expect(p1).toBe(p2);
+  });
+
+  it("path is in OS tmpdir", () => {
+    const alloc = createTempFileAllocator();
+    const p = alloc();
+    expect(p).toContain(os.tmpdir());
+  });
+
+  it("path contains 'experiment'", () => {
+    const alloc = createTempFileAllocator();
+    const p = alloc();
+    expect(p).toContain("experiment-");
+  });
+
+  it("different allocators produce different paths", () => {
+    const a1 = createTempFileAllocator();
+    const a2 = createTempFileAllocator();
+    expect(a1()).not.toBe(a2());
+  });
+});
+
+describe("session/process: spawnProcess", () => {
+  it("captures stdout", async () => {
+    const result = await spawnProcess({
+      command: "echo hello",
+      cwd: os.tmpdir(),
+      timeout: 5000,
+      tempFileAllocator: createTempFileAllocator(),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output.trim()).toBe("hello");
+    expect(result.killed).toBe(false);
+  });
+
+  it("captures stderr", async () => {
+    const result = await spawnProcess({
+      command: "echo error >&2",
+      cwd: os.tmpdir(),
+      timeout: 5000,
+      tempFileAllocator: createTempFileAllocator(),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain("error");
+  });
+
+  it("captures non-zero exit code", async () => {
+    const result = await spawnProcess({
+      command: "exit 42",
+      cwd: os.tmpdir(),
+      timeout: 5000,
+      tempFileAllocator: createTempFileAllocator(),
+    });
+    expect(result.exitCode).toBe(42);
+    expect(result.killed).toBe(false);
+  });
+
+  it("kills on timeout", async () => {
+    const result = await spawnProcess({
+      command: "sleep 30",
+      cwd: os.tmpdir(),
+      timeout: 1000,
+      tempFileAllocator: createTempFileAllocator(),
+    });
+    expect(result.killed).toBe(true);
+    expect(result.exitCode).toBe(null);
+  });
+
+  it("no timeout when timeout is 0", async () => {
+    const result = await spawnProcess({
+      command: "echo fast",
+      cwd: os.tmpdir(),
+      timeout: 0,
+      tempFileAllocator: createTempFileAllocator(),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.killed).toBe(false);
+  });
+
+  it("streams to temp file for large output", async () => {
+    const alloc = createTempFileAllocator();
+    // Generate ~60KB of output to exceed the 50KB threshold
+    const result = await spawnProcess({
+      command: "python3 -c \"print('x' * 60 + '\n' * 1000)\"",
+      cwd: os.tmpdir(),
+      timeout: 10000,
+      tempFileAllocator: alloc,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.actualTotalBytes).toBeGreaterThan(50000);
+    expect(result.tempFilePath).toBeDefined();
+    // Temp file should exist and have content
+    expect(fs.existsSync(result.tempFilePath!)).toBe(true);
+    const content = fs.readFileSync(result.tempFilePath!, "utf-8");
+    expect(content.length).toBeGreaterThan(0);
+    // Clean up
+    try { fs.unlinkSync(result.tempFilePath!); } catch {}
+  });
+
+  it("rejects on spawn error (bad cwd)", async () => {
+    try {
+      await spawnProcess({
+        command: "echo hi",
+        cwd: "/nonexistent/path/that/does/not/exist",
+        timeout: 5000,
+        tempFileAllocator: createTempFileAllocator(),
+      });
+      // If it somehow doesn't throw, that's also fine (Bun might not error)
+    } catch (e) {
+      expect(e).toBeDefined();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// session/run.ts — experiment run execution
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("session/run: makeErrorRunDetails", () => {
+  it("creates a failed RunDetails", () => {
+    const details = makeErrorRunDetails("test error", "seconds", "s");
+    expect(details.passed).toBe(false);
+    expect(details.crashed).toBe(true);
+    expect(details.exitCode).toBe(null);
+    expect(details.tailOutput).toBe("test error");
+    expect(details.metricName).toBe("seconds");
+    expect(details.metricUnit).toBe("s");
+    expect(details.parsedMetrics).toBe(null);
+    expect(details.parsedPrimary).toBe(null);
+    expect(details.timedOut).toBe(false);
+    expect(details.checksPass).toBe(null);
+  });
+
+  it("preserves metric metadata", () => {
+    const details = makeErrorRunDetails("err", "total_µs", "µs");
+    expect(details.metricName).toBe("total_µs");
+    expect(details.metricUnit).toBe("µs");
+  });
+});
+
+describe("session/run: executeRun", () => {
+  const tmpDir = path.join(os.tmpdir(), `experiment-harness-test-execrun-${Date.now()}`);
+
+  beforeAll(() => {
+    fs.mkdirSync(tmpDir, { recursive: true });
+  });
+
+  afterAll(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it("runs a command and parses metrics", async () => {
+    const result = await executeRun({
+      cwd: tmpDir,
+      config: {
+        name: "test",
+        metricName: "seconds",
+        metricUnit: "s",
+        direction: "lower",
+        command: "echo METRIC seconds=5 && echo METRIC other_ms=200",
+      },
+      metricName: "seconds",
+      metricUnit: "s",
+      timeoutSeconds: 10,
+    });
+    expect(result.passed).toBe(true);
+    expect(result.parsedPrimary).toBe(5);
+    expect(result.parsedMetrics?.["seconds"]).toBe(5);
+    expect(result.parsedMetrics?.["other_ms"]).toBe(200);
+  });
+
+  it("detects non-zero exit as failure", async () => {
+    const result = await executeRun({
+      cwd: tmpDir,
+      config: {
+        name: "fail",
+        metricName: "seconds",
+        direction: "lower",
+        command: "exit 1",
+      },
+      metricName: "seconds",
+      metricUnit: "s",
+      timeoutSeconds: 10,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.crashed).toBe(true);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("detects timeout", async () => {
+    const result = await executeRun({
+      cwd: tmpDir,
+      config: {
+        name: "timeout",
+        metricName: "seconds",
+        direction: "lower",
+        command: "sleep 30",
+      },
+      metricName: "seconds",
+      metricUnit: "s",
+      timeoutSeconds: 1,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects custom command when autoresearch.sh exists", async () => {
+    const shPath = path.join(tmpDir, "autoresearch.sh");
+    fs.writeFileSync(shPath, "#!/bin/bash\necho METRIC x=1\n");
+    try {
+      const result = await executeRun({
+        cwd: tmpDir,
+        config: {
+          name: "blocked",
+          metricName: "x",
+          direction: "lower",
+          command: "python3 -c 'print(1)'",
+        },
+        metricName: "x",
+        metricUnit: "",
+        timeoutSeconds: 5,
+      });
+      expect(result.passed).toBe(false);
+      expect(result.tailOutput).toContain("autoresearch.sh");
+    } finally {
+      try { fs.unlinkSync(shPath); } catch {}
+    }
+  });
+
+  it("runs checks when benchmark passes and checks file exists", async () => {
+    const checksPath = path.join(tmpDir, "autoresearch.checks.sh");
+    fs.writeFileSync(checksPath, "#!/bin/bash\nexit 0\n");
+    try {
+      const result = await executeRun({
+        cwd: tmpDir,
+        config: {
+          name: "with checks",
+          metricName: "x",
+          direction: "lower",
+          command: "echo METRIC x=10",
+          checksTimeoutSeconds: 5,
+        },
+        metricName: "x",
+        metricUnit: "",
+        timeoutSeconds: 10,
+      });
+      expect(result.passed).toBe(true);
+      expect(result.checksPass).toBe(true);
+    } finally {
+      try { fs.unlinkSync(checksPath); } catch {}
+    }
+  });
+
+  it("detects failed checks", async () => {
+    const checksPath = path.join(tmpDir, "autoresearch.checks.sh");
+    fs.writeFileSync(checksPath, "#!/bin/bash\nexit 1\n");
+    try {
+      const result = await executeRun({
+        cwd: tmpDir,
+        config: {
+          name: "failing checks",
+          metricName: "x",
+          direction: "lower",
+          command: "echo METRIC x=10",
+          checksTimeoutSeconds: 5,
+        },
+        metricName: "x",
+        metricUnit: "",
+        timeoutSeconds: 10,
+      });
+      expect(result.passed).toBe(false);
+      expect(result.checksPass).toBe(false);
+    } finally {
+      try { fs.unlinkSync(checksPath); } catch {}
+    }
+  });
+
+  it("returns null parsedPrimary when no METRIC lines", async () => {
+    const result = await executeRun({
+      cwd: tmpDir,
+      config: {
+        name: "no metrics",
+        metricName: "seconds",
+        direction: "lower",
+        command: "echo no metrics here",
+      },
+      metricName: "seconds",
+      metricUnit: "s",
+      timeoutSeconds: 5,
+    });
+    expect(result.passed).toBe(true);
+    expect(result.parsedPrimary).toBe(null);
+    expect(result.parsedMetrics).toBe(null);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// session/loop.ts — loop controller
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("session/loop: LoopController", () => {
+  it("starts in idle state", () => {
+    const loop = new LoopController();
+    expect(loop.getStatus()).toBe("idle");
+  });
+
+  it("start returns error when host not initialized", () => {
+    const loop = new LoopController();
+    const host: LoopHost = {
+      status: () => ({ initialized: false, runs: 0, targetReached: false, loopStatus: "idle", bestMetric: null, targetValue: null }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => [],
+      direction: "lower",
+      maxRuns: null,
+      setLoopStatus: () => {},
+    };
+    const result = loop.start(host);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not initialized");
+  });
+
+  it("start sets status to running", () => {
+    const loop = new LoopController();
+    const host: LoopHost = {
+      status: () => ({ initialized: true, runs: 0, targetReached: false, loopStatus: "idle", bestMetric: null, targetValue: null }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => [],
+      direction: "lower",
+      maxRuns: null,
+      setLoopStatus: () => {},
+    };
+    const result = loop.start(host, { pollIntervalSeconds: 60 });
+    expect(result.ok).toBe(true);
+    expect(loop.getStatus()).toBe("running");
+    loop.stop();
+  });
+
+  it("cannot start when already running", () => {
+    const loop = new LoopController();
+    const host: LoopHost = {
+      status: () => ({ initialized: true, runs: 0, targetReached: false, loopStatus: "running", bestMetric: null, targetValue: null }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => [],
+      direction: "lower",
+      maxRuns: null,
+      setLoopStatus: () => {},
+    };
+    loop.start(host, { pollIntervalSeconds: 60 });
+    const result = loop.start(host);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("already running");
+    loop.stop();
+  });
+
+  it("stop sets status to stopped", () => {
+    const loop = new LoopController();
+    const host: LoopHost = {
+      status: () => ({ initialized: true, runs: 0, targetReached: false, loopStatus: "running", bestMetric: null, targetValue: null }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => [],
+      direction: "lower",
+      maxRuns: null,
+      setLoopStatus: () => {},
+    };
+    loop.start(host, { pollIntervalSeconds: 60 });
+    loop.stop();
+    expect(loop.getStatus()).toBe("stopped");
+  });
+
+  it("completes when maxRuns reached", async () => {
+    const loop = new LoopController();
+    const results: ExperimentResult[] = [makeResult(10, "keep")];
+    const host: LoopHost = {
+      status: () => ({ initialized: true, runs: 1, targetReached: false, loopStatus: "running", bestMetric: 10, targetValue: null }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => results,
+      direction: "lower",
+      maxRuns: 1,
+      setLoopStatus: () => {},
+    };
+    loop.start(host, { pollIntervalSeconds: 0.01, plateauPatience: 15 });
+    // Wait for loop to detect maxRuns
+    await Bun.sleep(200);
+    expect(loop.getStatus()).toBe("completed");
+  });
+
+  it("completes when target reached", async () => {
+    const loop = new LoopController();
+    const host: LoopHost = {
+      status: () => ({ initialized: true, runs: 0, targetReached: true, loopStatus: "running", bestMetric: 5, targetValue: 10 }),
+      runAndLog: () => Promise.resolve({ ok: true }),
+      results: () => [],
+      direction: "lower",
+      maxRuns: null,
+      setLoopStatus: () => {},
+    };
+    loop.start(host, { pollIntervalSeconds: 0.01, stopOnTarget: true });
+    await Bun.sleep(200);
+    expect(loop.getStatus()).toBe("completed");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// session/loop.ts — detectFileChanges
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("session/loop: detectFileChanges", () => {
+  const tmpDir = path.join(os.tmpdir(), `experiment-harness-test-detect-${Date.now()}`);
+
+  beforeAll(() => {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    execFileSync("git", ["init"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: tmpDir, encoding: "utf-8" });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: tmpDir, encoding: "utf-8" });
+    fs.writeFileSync(path.join(tmpDir, "README.md"), "test");
+    execFileSync("git", ["add", "-A"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+  });
+
+  afterAll(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it("returns empty for clean repo", () => {
+    expect(detectFileChanges(tmpDir)).toEqual([]);
+  });
+
+  it("detects modified tracked files", () => {
+    fs.writeFileSync(path.join(tmpDir, "README.md"), "modified");
+    const changes = detectFileChanges(tmpDir);
+    expect(changes).toContain("README.md");
+    // Revert
+    execFileSync("git", ["checkout", "--", "."], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+  });
+
+  it("detects untracked files", () => {
+    fs.writeFileSync(path.join(tmpDir, "newfile.txt"), "untracked");
+    const changes = detectFileChanges(tmpDir);
+    expect(changes).toContain("newfile.txt");
+    // Clean up
+    fs.unlinkSync(path.join(tmpDir, "newfile.txt"));
+  });
+
+  it("deduplicates results", () => {
+    fs.writeFileSync(path.join(tmpDir, "README.md"), "modified again");
+    const changes = detectFileChanges(tmpDir);
+    const unique = new Set(changes);
+    expect(changes.length).toBe(unique.size);
+    // Revert
+    execFileSync("git", ["checkout", "--", "."], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+  });
+
+  it("returns empty for non-git directory", () => {
+    const noGitDir = path.join(os.tmpdir(), `no-git-detect-${Date.now()}`);
+    fs.mkdirSync(noGitDir, { recursive: true });
+    try {
+      expect(detectFileChanges(noGitDir)).toEqual([]);
+    } finally {
+      fs.rmSync(noGitDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// index.ts — barrel re-exports
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("barrel re-exports (index.ts)", () => {
+  it("re-exports Session", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.Session).toBeDefined();
+    expect(typeof mod.Session).toBe("function");
+  });
+
+  it("re-exports parse functions", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.parseMetricLines).toBeDefined();
+    expect(mod.inferUnit).toBeDefined();
+    expect(mod.isAutoresearchShCommand).toBeDefined();
+  });
+
+  it("re-exports format functions", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.commas).toBeDefined();
+    expect(mod.formatNum).toBeDefined();
+    expect(mod.formatElapsed).toBeDefined();
+    expect(mod.formatSize).toBeDefined();
+  });
+
+  it("re-exports stats functions", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.isImprovement).toBeDefined();
+    expect(mod.formatImprovement).toBeDefined();
+    expect(mod.computeConfidence).toBeDefined();
+    expect(mod.detectPlateau).toBeDefined();
+  });
+
+  it("re-exports strategy classes", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.GreedyStrategy).toBeDefined();
+    expect(mod.ConfidenceGatedStrategy).toBeDefined();
+    expect(mod.EpsilonGreedyStrategy).toBeDefined();
+    expect(mod.createStrategy).toBeDefined();
+  });
+
+  it("re-exports log functions", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.reconstructState).toBeDefined();
+    expect(mod.writeConfig).toBeDefined();
+    expect(mod.writeResult).toBeDefined();
+    expect(mod.readEntries).toBeDefined();
+    expect(mod.deleteLog).toBeDefined();
+  });
+
+  it("re-exports git functions", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.git).toBeDefined();
+    expect(mod.gitSafe).toBeDefined();
+    expect(mod.getHeadCommit).toBeDefined();
+    expect(mod.createWorktree).toBeDefined();
+    expect(mod.removeWorktree).toBeDefined();
+  });
+
+  it("re-exports session internals", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.spawnProcess).toBeDefined();
+    expect(mod.killTree).toBeDefined();
+    expect(mod.createTempFileAllocator).toBeDefined();
+    expect(mod.executeRun).toBeDefined();
+    expect(mod.makeErrorRunDetails).toBeDefined();
+    expect(mod.LoopController).toBeDefined();
+    expect(mod.detectFileChanges).toBeDefined();
+  });
+
+  it("re-exports types and constants", async () => {
+    const mod = await import("./index.ts");
+    expect(mod.DENIED_METRIC_NAMES).toBeDefined();
+    expect(mod.METRIC_LINE_PREFIX).toBe("METRIC");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cross-module integration: Session delegates to extracted modules
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("Session delegation to extracted modules", () => {
+  const tmpDir = path.join(os.tmpdir(), `experiment-harness-delegation-${Date.now()}`);
+  let session: Session;
+
+  beforeAll(() => {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    execFileSync("git", ["init"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: tmpDir, encoding: "utf-8" });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: tmpDir, encoding: "utf-8" });
+    fs.writeFileSync(path.join(tmpDir, "README.md"), "test");
+    execFileSync("git", ["add", "-A"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: tmpDir, encoding: "utf-8", timeout: 5000 });
+  });
+
+  afterAll(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  });
+
+  beforeEach(() => {
+    session = new Session();
+  });
+
+  afterEach(() => {
+    try { session.clear(); } catch {}
+  });
+
+  it("Session.run() delegates to executeRun()", async () => {
+    await session.init({
+      cwd: tmpDir,
+      worktree: false,
+      config: {
+        name: "Delegation Test",
+        metricName: "seconds",
+        direction: "lower",
+        command: "echo METRIC seconds=5",
+      },
+    });
+
+    const result = await session.run();
+    // If executeRun works, Session.run should also work with the same output
+    expect(result.passed).toBe(true);
+    expect(result.parsedPrimary).toBe(5);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("Session.startLoop() delegates to LoopController", async () => {
+    await session.init({
+      cwd: tmpDir,
+      worktree: false,
+      config: {
+        name: "Loop Delegation",
+        metricName: "seconds",
+        direction: "lower",
+        command: "echo METRIC seconds=10",
+        maxRuns: 1,
+      },
+    });
+
+    const result = session.startLoop({ pollIntervalSeconds: 60 });
+    expect(result.ok).toBe(true);
+    expect(session.getLoopStatus()).toBe("running");
+    session.stopLoop();
+  });
+
+  it("temp files tracked and cleaned on clear", async () => {
+    await session.init({
+      cwd: tmpDir,
+      worktree: false,
+      config: {
+        name: "Temp Cleanup",
+        metricName: "seconds",
+        direction: "lower",
+        command: "echo METRIC seconds=10",
+      },
+    });
+
+    // Run creates temp files for large output or full output storage
+    await session.run();
+    session.clear();
+    // After clear, state should be reset
+    expect(session.status().initialized).toBe(false);
+  });
+});

@@ -4,13 +4,15 @@
  * Holds all state for a single experiment session: config, results,
  * worktree, guard, strategy. Persists to JSONL. Reconstructs from JSONL.
  * Provides the API that the server exposes via /eval.
+ *
+ * Heavy lifting is delegated to:
+ *   session/process.ts — process spawning, temp files, kill-tree
+ *   session/run.ts     — execute benchmark, checks, metric parsing
+ *   session/loop.ts    — autonomous loop controller
  */
 
 import * as path from "node:path";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import { spawn, execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import type {
   SessionConfig,
   SessionState,
@@ -19,28 +21,26 @@ import type {
   RunDetails,
   GuardConfig,
   StrategyConfig,
-  StrategyDecision,
   LoopOptions,
   LoopStatus,
   JsonlConfigEntry,
   JsonlResultEntry,
-} from "./types.ts";
-import { parseMetricLines, isAutoresearchShCommand, inferUnit } from "./parse.ts";
-import { formatNum } from "./format.ts";
+  StrategyName,
+} from "../types.ts";
+import { inferUnit } from "../parse.ts";
 import {
   isBetter,
   computeConfidence,
-  detectPlateau,
   registerSecondaryMetrics,
   formatImprovement,
-} from "./stats.ts";
+} from "../stats.ts";
 import {
   reconstructState,
   writeConfig as writeJsonlConfig,
   writeResult as writeJsonlResult,
   readEntries,
   deleteLog,
-} from "./log.ts";
+} from "../log.ts";
 import {
   createWorktree,
   removeWorktree,
@@ -49,48 +49,21 @@ import {
   getHeadCommit,
   detectWorktree,
   getDisplayWorktreePath,
-} from "./git.ts";
-import { createStrategy, type Strategy } from "./strategy.ts";
-import type { StrategyName } from "./types.ts";
-
-// ---------------------------------------------------------------------------
-// Process management
-// ---------------------------------------------------------------------------
-
-/** Kill a process tree (best effort). */
-function killTree(pid: number): void {
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // Process may have already exited
-    }
-  }
-}
-
-/** Lazy temp file allocator. Uses OS tmpdir and crypto-random IDs (matching pi-autoresearch). */
-function createTempFileAllocator(): () => string {
-  let p: string | undefined;
-  return () => {
-    if (!p) {
-      const id = randomBytes(8).toString("hex");
-      p = path.join(os.tmpdir(), `experiment-${id}.log`);
-    }
-    return p;
-  };
-}
+} from "../git.ts";
+import { createStrategy, type Strategy } from "../strategy.ts";
+import { executeRun, makeErrorRunDetails } from "./run.ts";
+import { LoopController, type LoopHost } from "./loop.ts";
+import { createTempFileAllocator } from "./process.ts";
 
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
-export class Session {
+export class Session implements LoopHost {
   // Project root (where the git repo lives)
   private repoCwd: string = "";
   // Working directory (worktree if active, otherwise repoCwd)
-  private workDir: string = "";
+  /** @internal */ workDir: string = "";
   // Worktree path (null if not using worktree isolation)
   private worktreeDir: string | null = null;
 
@@ -109,10 +82,8 @@ export class Session {
   // Temp files created during runs (cleaned up on clear())
   private tempFiles: Set<string> = new Set();
 
-  // Loop state
-  private loopStatus: LoopStatus = "idle";
-  private loopOptions: LoopOptions | null = null;
-  private loopAbort: AbortController | null = null;
+  // Loop controller (extracted from session)
+  private loop: LoopController;
 
   // Session ID (used for worktree naming)
   private sessionId: string = "";
@@ -120,6 +91,7 @@ export class Session {
   constructor() {
     this.state = this.createInitialState();
     this.strategy = createStrategy();
+    this.loop = new LoopController();
   }
 
   private createInitialState(): SessionState {
@@ -138,6 +110,26 @@ export class Session {
       maxRuns: null,
       guard: null,
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // LoopHost interface (used by LoopController)
+  // -----------------------------------------------------------------------
+
+  /** Current direction — exposed for LoopHost. */
+  get direction(): "lower" | "higher" {
+    return this.state.direction;
+  }
+
+  /** Current max runs — exposed for LoopHost. */
+  get maxRuns(): number | null {
+    return this.state.maxRuns;
+  }
+
+  /** Update loop status — called by LoopController. */
+  setLoopStatus(status: LoopStatus): void {
+    // The loop controller manages its own status;
+    // this is a no-op hook for future extensibility.
   }
 
   // -----------------------------------------------------------------------
@@ -262,110 +254,33 @@ export class Session {
   async run(opts: { timeoutSeconds?: number } = {}): Promise<RunDetails> {
     const config = this.state.config;
     if (!config) {
-      return this.makeErrorRunDetails("Session not initialized — call init() first");
-    }
-
-    // Guard: if autoresearch.sh exists, only allow running it
-    const autoresearchShPath = path.join(this.workDir, "autoresearch.sh");
-    if (
-      fs.existsSync(autoresearchShPath) &&
-      !isAutoresearchShCommand(config.command)
-    ) {
-      return this.makeErrorRunDetails(
-        `autoresearch.sh exists — you must run it instead of a custom command.`,
+      return makeErrorRunDetails(
+        "Session not initialized — call init() first",
+        this.state.metricName,
+        this.state.metricUnit,
       );
     }
 
     // Check max runs
     if (this.state.maxRuns !== null && this.state.results.length >= this.state.maxRuns) {
-      return this.makeErrorRunDetails(
+      return makeErrorRunDetails(
         `Maximum runs reached (${this.state.maxRuns})`,
+        this.state.metricName,
+        this.state.metricUnit,
       );
     }
 
-    const timeout = (opts.timeoutSeconds ?? 600) * 1000;
-    const t0 = Date.now();
-
-    const getTempFile = createTempFileAllocator();
-    const {
-      exitCode,
-      killed: timedOut,
-      output,
-      tempFilePath: streamTempFile,
-      actualTotalBytes,
-    } = await this.spawnProcess(config.command, timeout);
-
-    const durationSeconds = (Date.now() - t0) / 1000;
-    const benchmarkPassed = exitCode === 0 && !timedOut;
-
-    // Run backpressure checks if benchmark passed and checks file exists
-    let checksPass: boolean | null = null;
-    let checksTimedOut = false;
-    let checksOutput = "";
-    let checksDuration = 0;
-
-    const checksPath = path.join(this.workDir, "autoresearch.checks.sh");
-    if (benchmarkPassed && fs.existsSync(checksPath)) {
-      const checksTimeout = (config.checksTimeoutSeconds ?? 300) * 1000;
-      const ct0 = Date.now();
-      try {
-        const checksResult = await this.spawnProcess(
-          `bash ${checksPath}`,
-          checksTimeout,
-        );
-        checksDuration = (Date.now() - ct0) / 1000;
-        checksTimedOut = !!checksResult.killed;
-        checksPass = checksResult.exitCode === 0 && !checksResult.killed;
-        checksOutput = checksResult.output.trim();
-      } catch (e) {
-        checksDuration = (Date.now() - ct0) / 1000;
-        checksPass = false;
-        checksOutput = e instanceof Error ? e.message : String(e);
-      }
-    }
-
-    const passed = benchmarkPassed && (checksPass === null || checksPass);
-
-    // Max output for LLM context
-    const maxLines = 10;
-    const maxBytes = 4 * 1024;
-    const lines = output.split("\n");
-    const tailStart = Math.max(0, lines.length - maxLines);
-    const tailOutput = lines.slice(tailStart).join("\n");
-
-    // Parse structured METRIC lines
-    const parsedMetricMap = parseMetricLines(output);
-    const parsedMetrics = parsedMetricMap.size > 0 ? Object.fromEntries(parsedMetricMap) : null;
-    const parsedPrimary = parsedMetricMap.get(this.state.metricName) ?? null;
-
-    // Full output temp file for large outputs
-    let fullOutputPath: string | undefined = streamTempFile;
-    if (!fullOutputPath && (actualTotalBytes > maxBytes || lines.length > maxLines)) {
-      fullOutputPath = getTempFile();
-      fs.writeFileSync(fullOutputPath, output);
-    }
-
-    // Track temp files for cleanup
-    if (fullOutputPath) this.tempFiles.add(fullOutputPath);
-
-    const runDetails: RunDetails = {
-      command: config.command,
-      exitCode,
-      durationSeconds,
-      passed,
-      crashed: !passed,
-      timedOut,
-      tailOutput,
-      checksPass,
-      checksTimedOut,
-      checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
-      checksDuration,
-      parsedMetrics,
-      parsedPrimary,
+    const runDetails = await executeRun({
+      cwd: this.workDir,
+      config,
       metricName: this.state.metricName,
       metricUnit: this.state.metricUnit,
-      fullOutputPath,
-    };
+      timeoutSeconds: opts.timeoutSeconds,
+      checksTimeoutSeconds: config.checksTimeoutSeconds,
+    });
+
+    // Track temp files for cleanup
+    if (runDetails.fullOutputPath) this.tempFiles.add(runDetails.fullOutputPath);
 
     // Store last run details for the log() checks gate
     this.lastRunDetails = runDetails;
@@ -625,142 +540,35 @@ export class Session {
    * runs the benchmark, and applies the strategy automatically.
    */
   startLoop(opts: LoopOptions = {}): { ok: boolean; loopId?: string; error?: string } {
-    if (!this.state.config) {
-      return { ok: false, error: "Session not initialized — call init() first" };
-    }
-
-    if (this.loopStatus === "running") {
-      return { ok: false, error: "Loop already running" };
-    }
-
-    this.loopOptions = opts;
-    this.loopAbort = new AbortController();
-    this.loopStatus = "running";
-
     // Apply the loop's strategy to the session if specified
     // (so runAndLog uses it; restored on stop)
     if (opts.strategy) {
       this.strategy = createStrategy(opts.strategy);
     }
 
-    const loopId = `loop-${Date.now()}`;
-
-    // Run the loop in the background (non-blocking)
-    this.runLoop(opts, this.loopAbort.signal).catch((e) => {
-      console.error(`Loop error: ${e}`);
-      this.loopStatus = "stopped";
-    });
-
-    return { ok: true, loopId };
+    const result = this.loop.start(this, opts);
+    if (!result.ok && opts.strategy) {
+      // Restore default strategy on failure
+      this.strategy = createStrategy();
+    }
+    return result;
   }
 
   /** Stop the autonomous loop. */
   stopLoop(): { ok: boolean } {
-    if (this.loopAbort) {
-      this.loopAbort.abort();
-    }
-    this.loopStatus = "stopped";
+    const result = this.loop.stop();
 
     // Restore default strategy if loop had overridden it
-    if (this.loopOptions?.strategy) {
+    if (this.loop["options"]?.strategy) {
       this.strategy = createStrategy();
     }
 
-    return { ok: true };
+    return result;
   }
 
   /** Get current loop status. */
   getLoopStatus(): LoopStatus {
-    return this.loopStatus;
-  }
-
-  private async runLoop(opts: LoopOptions, signal: AbortSignal): Promise<void> {
-    const pollInterval = (opts.pollIntervalSeconds ?? 2) * 1000;
-    const plateauPatience = opts.plateauPatience ?? 15;
-    let lastRunTime = 0;
-
-    while (!signal.aborted) {
-      // Check stopping conditions
-      if (this.state.maxRuns !== null && this.state.results.length >= this.state.maxRuns) {
-        this.loopStatus = "completed";
-        return;
-      }
-
-      // Check target reached
-      if (opts.stopOnTarget !== false && this.isTargetReached()) {
-        this.loopStatus = "completed";
-        return;
-      }
-
-      // Check plateau
-      const plateau = detectPlateau(
-        this.state.results,
-        this.state.direction,
-        plateauPatience,
-      );
-      if (plateau.plateaued) {
-        this.loopStatus = "paused";
-        return;
-      }
-
-      // Detect file changes since last run (including untracked files)
-      const changes = this.detectFileChanges();
-      if (changes.length === 0) {
-        await Bun.sleep(pollInterval);
-        continue;
-      }
-
-      // Run the experiment
-      const result = await this.runAndLog({
-        description: `auto-run #${this.state.results.length + 1}`,
-      });
-
-      if (!result.ok) {
-        // Wait before retrying
-        await Bun.sleep(pollInterval);
-        continue;
-      }
-
-      await Bun.sleep(500); // Small delay between runs
-    }
-  }
-
-  /** Check if the target value has been reached. */
-  private isTargetReached(): boolean {
-    if (this.state.targetValue === null || this.state.bestMetric === null) return false;
-    return this.state.direction === "lower"
-      ? this.state.bestMetric <= this.state.targetValue
-      : this.state.bestMetric >= this.state.targetValue;
-  }
-
-  /** Detect file changes in the worktree since last run (tracked and untracked). */
-  private detectFileChanges(): string[] {
-    try {
-      // Tracked changes
-      const tracked = execFileSync("git", ["diff", "--name-only", "HEAD"], {
-        cwd: this.workDir,
-        encoding: "utf-8",
-        timeout: 5000,
-        stdio: ["pipe", "pipe", "ignore"],
-      }).trim();
-
-      // Untracked files (not yet added to git)
-      const untracked = execFileSync(
-        "git",
-        ["ls-files", "--others", "--exclude-standard"],
-        {
-          cwd: this.workDir,
-          encoding: "utf-8",
-          timeout: 5000,
-          stdio: ["pipe", "pipe", "ignore"],
-        },
-      ).trim();
-
-      const all = (tracked + "\n" + untracked).split("\n").filter(Boolean);
-      return [...new Set(all)]; // deduplicate
-    } catch {
-      return [];
-    }
+    return this.loop.getStatus();
   }
 
   // -----------------------------------------------------------------------
@@ -804,7 +612,7 @@ export class Session {
       confidence: this.state.confidence,
       targetValue: this.state.targetValue,
       targetReached: this.isTargetReached(),
-      loopStatus: this.loopStatus,
+      loopStatus: this.getLoopStatus(),
       worktree: this.worktreeDir,
     };
   }
@@ -820,10 +628,7 @@ export class Session {
 
   /** Clear session state and clean up resources. */
   clear(): { ok: boolean } {
-    if (this.loopAbort) {
-      this.loopAbort.abort();
-    }
-    this.loopStatus = "idle";
+    this.loop.stop();
 
     if (this.worktreeDir) {
       removeWorktree(this.repoCwd, this.worktreeDir);
@@ -877,109 +682,11 @@ export class Session {
     return this.lastRunDetails.checksPass === false;
   }
 
-  private async spawnProcess(
-    command: string,
-    timeout: number,
-  ): Promise<{
-    exitCode: number | null;
-    killed: boolean;
-    output: string;
-    tempFilePath: string | undefined;
-    actualTotalBytes: number;
-  }> {
-    return new Promise((resolve, reject) => {
-      let processTimedOut = false;
-
-      const child = spawn("bash", ["-c", command], {
-        cwd: this.workDir,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      const chunks: Buffer[] = [];
-      let chunksBytes = 0;
-      const maxChunksBytes = 100 * 1024; // 100KB rolling buffer
-
-      let tempFilePath: string | undefined;
-      let tempFileStream: ReturnType<typeof fs.createWriteStream> | undefined;
-      let totalBytes = 0;
-
-      const getTempFile = createTempFileAllocator();
-
-      const handleData = (data: Buffer) => {
-        totalBytes += data.length;
-
-        if (totalBytes > 50000 && !tempFilePath) {
-          tempFilePath = getTempFile();
-          tempFileStream = fs.createWriteStream(tempFilePath);
-          for (const chunk of chunks) {
-            tempFileStream.write(chunk);
-          }
-        }
-
-        if (tempFileStream) {
-          tempFileStream.write(data);
-        }
-
-        chunks.push(data);
-        chunksBytes += data.length;
-
-        while (chunksBytes > maxChunksBytes && chunks.length > 1) {
-          const removed = chunks.shift()!;
-          chunksBytes -= removed.length;
-        }
-      };
-
-      if (child.stdout) child.stdout.on("data", handleData);
-      if (child.stderr) child.stderr.on("data", handleData);
-
-      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-      if (timeout > 0) {
-        timeoutHandle = setTimeout(() => {
-          processTimedOut = true;
-          if (child.pid) killTree(child.pid);
-        }, timeout);
-      }
-
-      child.on("error", (err) => {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        if (tempFileStream) tempFileStream.end();
-        reject(err);
-      });
-
-      child.on("close", (code) => {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        if (tempFileStream) tempFileStream.end();
-
-        const fullBuffer = Buffer.concat(chunks);
-        resolve({
-          exitCode: code,
-          killed: processTimedOut,
-          output: fullBuffer.toString("utf-8"),
-          tempFilePath,
-          actualTotalBytes: totalBytes,
-        });
-      });
-    });
-  }
-
-  private makeErrorRunDetails(message: string): RunDetails {
-    return {
-      command: "",
-      exitCode: null,
-      durationSeconds: 0,
-      passed: false,
-      crashed: true,
-      timedOut: false,
-      tailOutput: message,
-      checksPass: null,
-      checksTimedOut: false,
-      checksOutput: "",
-      checksDuration: 0,
-      parsedMetrics: null,
-      parsedPrimary: null,
-      metricName: this.state.metricName,
-      metricUnit: this.state.metricUnit,
-    };
+  /** Check if the target value has been reached. */
+  private isTargetReached(): boolean {
+    if (this.state.targetValue === null || this.state.bestMetric === null) return false;
+    return this.state.direction === "lower"
+      ? this.state.bestMetric <= this.state.targetValue
+      : this.state.bestMetric >= this.state.targetValue;
   }
 }
