@@ -17,6 +17,14 @@ export interface Strategy {
   evaluate(result: ExperimentResult, state: SessionState): StrategyDecision;
 }
 
+/** Random source interface for deterministic testing. */
+export interface RandomSource {
+  random(): number;
+}
+
+/** Default random source using Math.random. */
+const defaultRandom: RandomSource = { random: () => Math.random() };
+
 // ---------------------------------------------------------------------------
 // Implementations
 // ---------------------------------------------------------------------------
@@ -71,9 +79,18 @@ export class ConfidenceGatedStrategy implements Strategy {
 /**
  * Epsilon-greedy: mostly greedy, but with probability epsilon
  * keeps marginal improvements for exploration.
+ * Accepts an injectable random source for deterministic testing.
  */
 export class EpsilonGreedyStrategy implements Strategy {
-  constructor(private epsilon: number = 0.1) {}
+  private rng: RandomSource;
+
+  constructor(epsilon: number = 0.1, rng?: RandomSource) {
+    this.rng = rng ?? defaultRandom;
+    // Capture epsilon at construction time for consistency
+    this.epsilon = epsilon;
+  }
+
+  private epsilon: number;
 
   evaluate(result: ExperimentResult, state: SessionState): StrategyDecision {
     if (result.status !== "keep") return "discard";
@@ -84,7 +101,7 @@ export class EpsilonGreedyStrategy implements Strategy {
     }
 
     // With probability epsilon, keep marginal/no-change results (exploration)
-    if (Math.random() < this.epsilon) return "keep";
+    if (this.rng.random() < this.epsilon) return "keep";
 
     return "discard";
   }
