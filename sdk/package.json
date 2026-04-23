@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "bun server.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:dead": "knip --no-gitignore"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "knip": "^6.6.2",
     "typescript": "^5.5.0"
   }
 }
