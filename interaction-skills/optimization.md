@@ -20,9 +20,6 @@ experiment-harness-js 'await session.init({
   }
 })'
 
-# Set a guard to prevent regressions
-experiment-harness-js 'await session.setGuard({ command: "pnpm test --run", mode: "pass-fail" })'
-
 # Start the autonomous loop
 experiment-harness-js 'await session.startLoop({ strategy: "confidence-gated" })'
 ```

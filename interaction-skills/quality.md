@@ -38,6 +38,12 @@ echo "METRIC coverage_pct=$COVERAGE"
 ## Tips
 
 - Coverage is deterministic — `greedy` strategy works well
-- Set a guard to prevent type errors: `session.setGuard({ command: "tsc --noEmit", mode: "pass-fail" })`
+- Write an `autoresearch.checks.sh` script to guard against type errors:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+tsc --noEmit
+```
 - Report secondary metrics: test count, assertion count
 - Coverage targets are great for bounded runs — set `maxRuns` to control cost

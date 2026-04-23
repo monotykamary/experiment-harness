@@ -183,17 +183,7 @@ experiment-harness-js 'session.results({ last: 5 })'
 # → [ { run: 19, metric: 11.8, status: "keep", ... }, ... ]
 ```
 
-### 9. Set guard (backpressure checks)
-
-```bash
-# Pass/fail guard
-experiment-harness-js 'await session.setGuard({ command: "pnpm test", mode: "pass-fail" })'
-
-# Metric-valued guard (bundle size can't grow more than 5%)
-experiment-harness-js 'await session.setGuard({ command: "pnpm build && du -sb dist", mode: "metric-valued", direction: "lower", thresholdPercent: 5 })'
-```
-
-### 10. Set strategy
+### 9. Set strategy
 
 ```bash
 experiment-harness-js 'await session.setStrategy("confidence-gated")'

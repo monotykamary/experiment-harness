@@ -155,7 +155,7 @@ WHILE not stopped:
 | `session.stopLoop()` | Stop the loop |
 | `session.status()` | Current session status |
 | `session.results(opts)` | Get result history |
-| `session.setGuard(config)` | Set backpressure guard |
+| `autoresearch.sh` + `autoresearch.checks.sh` | Backpressure guard as shell scripts |
 | `session.setStrategy(config)` | Set keep/discard strategy |
 | `session.clear()` | Reset all state, remove worktree |
 
